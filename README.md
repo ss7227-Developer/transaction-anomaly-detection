@@ -1,51 +1,149 @@
 # Real-Time Transaction Anomaly Detection
 
-Event-driven risk monitoring system that scores financial transactions with low latency using a PyTorch autoencoder, Flask API, and Redis queue — with full audit logging and model versioning.
+Event-driven fraud detection system that scores financial transactions using an **ensemble of two unsupervised ML models** — a PyTorch autoencoder and an Isolation Forest — served via a Flask API with Redis queuing, PostgreSQL audit storage, multi-tenant API key authentication, and an alert management workflow.
 
 ## Architecture
 
 ```
 apps/
-  api/        Flask REST API — receives transactions, enqueues to Redis
-  scorer/     Async worker — dequeues, runs autoencoder inference, writes to PostgreSQL
-  scripts/    Utility scripts (data checks, load testing)
+  api/          Flask REST API — authenticates clients, persists raw txns, enqueues to Redis
+  scorer/       Async worker — dequeues, runs ensemble inference, writes predictions + alerts
+  scripts/      Data generation and load testing utilities
 ml/
-  training/   Autoencoder training pipeline (PyTorch)
-  features/   Feature engineering and preprocessing
-  artifacts/  Saved model weights and scaler (gitignored — see below)
+  features/     Feature engineering (haversine distance, time delta, temporal features)
+  training/     Training pipeline for both models using real simulated data
+  evaluation/   Comparative evaluation: F1, precision, recall, confusion matrix, business impact
+  artifacts/    Saved model weights, scaler, threshold (gitignored)
 infra/
-  postgres/   DB schema (init.sql)
+  postgres/     DB schema — transactions, per-model predictions, alert lifecycle
   docker-compose.yml
 ```
 
+## ML Design
+
+### Models
+
+Two unsupervised anomaly detectors are trained and run in ensemble — a transaction is flagged if **either** model raises an alert.
+
+| Model | Trained on | Anomaly signal |
+|---|---|---|
+| **Autoencoder** (PyTorch) | Normal transactions only | Reconstruction error > learned threshold |
+| **Isolation Forest** (scikit-learn) | Normal + known fraud | `predict() == -1` (isolated outlier) |
+
+The autoencoder learns a compressed latent representation of normal spending patterns. Unusual transactions reconstruct poorly, producing high MSE error. The Isolation Forest provides a complementary tree-based signal that doesn't require calibrating a continuous threshold.
+
+### Features (7 total)
+
+| Feature | Source |
+|---|---|
+| `amount` | Raw transaction field |
+| `transaction_hour` | Extracted from timestamp |
+| `transaction_day_of_week` | Extracted from timestamp |
+| `distance_from_home` | Haversine distance (km) between tx location and user home |
+| `time_since_last_transaction` | Per-user velocity; tracked in Redis across warm Lambda invocations |
+| `latitude`, `longitude` | Raw GPS fields |
+
+### Fraud types modeled in training data
+
+- **High-amount**: amount 5–20× user average
+- **Foreign location**: random GPS far from home
+- **Velocity attack**: 1–4 rapid small transactions in burst
+- **Stolen card**: high amount + foreign location
+
+### Evaluation (sample output)
+
+```
+Model                        F1       Prec    Recall    Net Savings
+Autoencoder                0.XXXX   0.XXXX   0.XXXX   $XXX,XXX
+Isolation Forest           0.XXXX   0.XXXX   0.XXXX   $XXX,XXX
+Ensemble  (AE OR IF flags) 0.XXXX   0.XXXX   0.XXXX   $XXX,XXX
+```
+
+Business impact is computed using simulated costs: $100/false positive (manual review), $1,000/true positive (fraud prevented), $500 average undetected fraud loss.
+
 ## Stack
 
-- **ML**: PyTorch autoencoder trained on normalized transaction features
-- **API**: Flask + Redis queue for async scoring
-- **Storage**: PostgreSQL with append-only audit log table
+- **ML**: PyTorch autoencoder + scikit-learn Isolation Forest
+- **API**: Flask + psycopg3, multi-tenant API key auth
+- **Queue**: Redis (async decoupling between ingestion and scoring)
+- **Storage**: PostgreSQL — immutable transaction log, per-model predictions, alert lifecycle
 - **Infra**: Docker Compose (API, scorer worker, Redis, PostgreSQL)
 
 ## Running Locally
 
 ```bash
-# Start all services
+# 1. Generate training data
+python apps/scripts/generate_data.py \
+  --users 100 --transactions 10000 \
+  --out ml/artifacts/dev/simulated_transactions.csv
+
+# 2. Train both models
+python -m ml.training.train \
+  --csv ml/artifacts/dev/simulated_transactions.csv \
+  --out-dir ml/artifacts/dev
+
+# 3. Evaluate and compare models
+python -m ml.evaluation.evaluate \
+  --csv ml/artifacts/dev/simulated_transactions.csv \
+  --model-dir ml/artifacts/dev
+
+# 4. Start all services
 docker-compose -f infra/docker-compose.yml up --build
-
-# Train the model (saves artifacts to ml/artifacts/dev/)
-cd ml && python training/train.py
-
-# Send a test transaction
-curl -X POST http://localhost:5000/score \
-  -H "Content-Type: application/json" \
-  -d '{"amount": 9500, "merchant_id": "m_42", "user_id": "u_17"}'
 ```
 
-## Model
+## API
 
-The autoencoder learns a compressed representation of normal transaction patterns. At inference time, reconstruction error above a learned threshold flags a transaction as anomalous. Threshold is persisted alongside the model weights for reproducibility.
+All endpoints require `X-Client-Id` and `X-API-Key` headers. Set clients via the `CLIENT_API_KEYS` env var:
 
-## Governance
+```
+CLIENT_API_KEYS=client_a=secret1,client_b=secret2
+```
 
-- Model version is logged with every scored transaction
-- All scores are written to an immutable audit log in PostgreSQL
-- Scaler and threshold are versioned alongside model weights
+### Ingest a transaction
+```bash
+curl -X POST http://localhost:8000/v1/transactions \
+  -H "X-Client-Id: client_a" \
+  -H "X-API-Key: secret1" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": "u_17",
+    "amount": 9500,
+    "latitude": 51.5,
+    "longitude": -0.1,
+    "home_lat": 40.71,
+    "home_lon": -74.01
+  }'
+```
+
+### Query predictions (filter by model)
+```bash
+curl "http://localhost:8000/v1/predictions?model_name=autoencoder&limit=20" \
+  -H "X-Client-Id: client_a" -H "X-API-Key: secret1"
+
+curl "http://localhost:8000/v1/predictions?model_name=isolation_forest&limit=20" \
+  -H "X-Client-Id: client_a" -H "X-API-Key: secret1"
+```
+
+### Manage alerts
+```bash
+# List open alerts
+curl "http://localhost:8000/v1/alerts?status=OPEN" \
+  -H "X-Client-Id: client_a" -H "X-API-Key: secret1"
+
+# Update status
+curl -X POST "http://localhost:8000/v1/alerts/<tx_id>/status" \
+  -H "X-Client-Id: client_a" -H "X-API-Key: secret1" \
+  -d '{"status": "INVESTIGATING"}'
+
+# Add analyst note
+curl -X POST "http://localhost:8000/v1/alerts/<tx_id>/note" \
+  -H "X-Client-Id: client_a" -H "X-API-Key: secret1" \
+  -d '{"note": "Confirmed fraud — user contacted."}'
+```
+
+## Model Governance
+
+- Each prediction row records `model_name` and `model_version` alongside the score — the ensemble decision is auditable per model
+- AE threshold is computed at training time (99.5th percentile of normal validation errors) and versioned with the model weights
+- All transactions are written to an immutable PostgreSQL log before scoring begins
+- Per-user Redis state (last transaction timestamp) is tenant-scoped (`client_id:user_id`) with a 30-day TTL

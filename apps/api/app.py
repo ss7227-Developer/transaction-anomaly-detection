@@ -5,7 +5,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-import psycopg2
+import psycopg
 import redis
 from flask import Flask, request, jsonify
 
@@ -14,7 +14,9 @@ REDIS_URL = os.environ["REDIS_URL"]
 
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 app = Flask(__name__)
-def parse_client_keys(s: str) -> dict[str, str]:
+
+
+def _parse_client_keys(s: str) -> dict[str, str]:
     out = {}
     for part in (s or "").split(","):
         part = part.strip()
@@ -24,37 +26,38 @@ def parse_client_keys(s: str) -> dict[str, str]:
         out[k.strip()] = v.strip()
     return out
 
-CLIENT_API_KEYS = parse_client_keys(os.environ.get("CLIENT_API_KEYS", ""))
 
-def require_auth(req) -> str:
+CLIENT_API_KEYS = _parse_client_keys(os.environ.get("CLIENT_API_KEYS", ""))
+
+
+def _require_auth(req) -> str:
     client_id = req.headers.get("X-Client-Id")
     api_key = req.headers.get("X-API-Key")
-
     if not client_id or not api_key:
         raise ValueError("missing_auth_headers")
-
     expected = CLIENT_API_KEYS.get(client_id)
     if not expected or expected != api_key:
         raise ValueError("invalid_api_key")
-
     return client_id
 
-def row_to_dict(row, cols):
+
+def _row(row, cols):
     return {c: row[i] for i, c in enumerate(cols)}
+
 
 @app.get("/health")
 def health():
     return jsonify({"ok": True})
+
 
 @app.post("/v1/transactions")
 def ingest_transaction():
     body = request.get_json(force=True)
 
     try:
-        client_id = require_auth(request)
+        client_id = _require_auth(request)
     except ValueError as e:
         return jsonify({"error": str(e)}), 401
-
 
     required = ["user_id", "amount", "latitude", "longitude", "home_lat", "home_lon"]
     missing = [k for k in required if k not in body]
@@ -79,63 +82,57 @@ def ingest_transaction():
         "home_lon": float(body["home_lon"]),
     }
 
-    # Persist raw tx (audit trail)
     with psycopg.connect(DATABASE_URL) as conn:
         conn.execute(
             """
-            insert into transactions(id, client_id, user_id, ts, amount, currency, merchant, payment_method,
-                                     latitude, longitude, home_lat, home_lon)
+            insert into transactions(id, client_id, user_id, ts, amount, currency,
+                                     merchant, payment_method, latitude, longitude,
+                                     home_lat, home_lon)
             values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             on conflict (id) do nothing
             """,
-            (
-                tx_id,client_id, event["user_id"], ts, event["amount"], event["currency"],
-                event["merchant"], event["payment_method"],
-                event["latitude"], event["longitude"], event["home_lat"], event["home_lon"]
-            ),
+            (tx_id, client_id, event["user_id"], ts, event["amount"], event["currency"],
+             event["merchant"], event["payment_method"],
+             event["latitude"], event["longitude"], event["home_lat"], event["home_lon"]),
         )
         conn.commit()
 
-    # Enqueue for scoring (worker comes in Step 2)
     r.rpush("tx_queue", json.dumps(event))
-
     return jsonify({"transaction_id": tx_id, "enqueued": True}), 202
 
 
 @app.get("/v1/transactions/<tx_id>")
 def get_transaction(tx_id: str):
     try:
-        client_id = require_auth(request)
+        client_id = _require_auth(request)
     except ValueError as e:
         return jsonify({"error": str(e)}), 401
 
-    cols = ["id", "client_id", "user_id", "ts", "amount", "currency", "merchant", "payment_method",
-            "latitude", "longitude", "home_lat", "home_lon", "created_at"]
+    cols = ["id", "client_id", "user_id", "ts", "amount", "currency",
+            "merchant", "payment_method", "latitude", "longitude",
+            "home_lat", "home_lon", "created_at"]
 
     with psycopg.connect(DATABASE_URL) as conn:
         cur = conn.execute(
-            """
-            select id, client_id, user_id, ts, amount, currency, merchant, payment_method,
-                   latitude, longitude, home_lat, home_lon, created_at
-            from transactions
-            where id = %s and client_id = %s
-            """,
+            "select " + ", ".join(cols) +
+            " from transactions where id = %s and client_id = %s",
             (tx_id, client_id),
         )
         row = cur.fetchone()
 
     if not row:
         return jsonify({"error": "not_found"}), 404
+    return jsonify(_row(row, cols))
 
-    return jsonify(row_to_dict(row, cols))
 
 @app.get("/v1/predictions")
 def list_predictions():
     try:
-        client_id = require_auth(request)
+        client_id = _require_auth(request)
     except ValueError as e:
         return jsonify({"error": str(e)}), 401
 
+    model_name = request.args.get("model_name")
     limit = request.args.get("limit", "50")
     try:
         limit_i = max(1, min(200, int(limit)))
@@ -145,26 +142,27 @@ def list_predictions():
     cols = ["client_id", "transaction_id", "model_name", "model_version",
             "reconstruction_error", "anomaly_threshold", "is_predicted_anomaly", "created_at"]
 
-    with psycopg.connect(DATABASE_URL) as conn:
-        cur = conn.execute(
-            """
-            select client_id, transaction_id, model_name, model_version,
-                   reconstruction_error, anomaly_threshold, is_predicted_anomaly, created_at
-            from predictions
-            where client_id = %s
-            order by created_at desc
-            limit %s
-            """,
-            (client_id, limit_i),
-        )
-        rows = cur.fetchall()
+    sql = ("select " + ", ".join(cols) +
+           " from predictions where client_id = %s")
+    params: list = [client_id]
 
-    return jsonify([row_to_dict(r, cols) for r in rows])
+    if model_name:
+        sql += " and model_name = %s"
+        params.append(model_name)
+
+    sql += " order by created_at desc limit %s"
+    params.append(limit_i)
+
+    with psycopg.connect(DATABASE_URL) as conn:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+
+    return jsonify([_row(r, cols) for r in rows])
+
 
 @app.get("/v1/alerts")
 def list_alerts():
     try:
-        client_id = require_auth(request)
+        client_id = _require_auth(request)
     except ValueError as e:
         return jsonify({"error": str(e)}), 401
 
@@ -175,12 +173,9 @@ def list_alerts():
     except Exception:
         return jsonify({"error": "invalid_limit"}), 400
 
-    sql = """
-      select client_id, transaction_id, status, note, created_at, updated_at
-      from alerts
-      where client_id = %s
-    """
-    params = [client_id]
+    sql = ("select client_id, transaction_id, status, note, created_at, updated_at"
+           " from alerts where client_id = %s")
+    params: list = [client_id]
 
     if status:
         sql += " and status = %s"
@@ -189,16 +184,17 @@ def list_alerts():
     sql += " order by updated_at desc limit %s"
     params.append(limit_i)
 
-    cols = ["client_id","transaction_id","status","note","created_at","updated_at"]
+    cols = ["client_id", "transaction_id", "status", "note", "created_at", "updated_at"]
     with psycopg.connect(DATABASE_URL) as conn:
         rows = conn.execute(sql, tuple(params)).fetchall()
 
-    return jsonify([row_to_dict(r, cols) for r in rows])
+    return jsonify([_row(r, cols) for r in rows])
+
 
 @app.post("/v1/alerts/<tx_id>/status")
 def update_alert_status(tx_id: str):
     try:
-        client_id = require_auth(request)
+        client_id = _require_auth(request)
     except ValueError as e:
         return jsonify({"error": str(e)}), 401
 
@@ -207,11 +203,11 @@ def update_alert_status(tx_id: str):
     if status not in {"OPEN", "INVESTIGATING", "RESOLVED"}:
         return jsonify({"error": "invalid_status"}), 400
 
+    cols = ["client_id", "transaction_id", "status", "note", "created_at", "updated_at"]
     with psycopg.connect(DATABASE_URL) as conn:
         cur = conn.execute(
             """
-            update alerts
-            set status = %s
+            update alerts set status = %s
             where client_id = %s and transaction_id = %s
             returning client_id, transaction_id, status, note, created_at, updated_at
             """,
@@ -222,14 +218,13 @@ def update_alert_status(tx_id: str):
 
     if not row:
         return jsonify({"error": "not_found"}), 404
+    return jsonify(_row(row, cols))
 
-    cols = ["client_id","transaction_id","status","note","created_at","updated_at"]
-    return jsonify(row_to_dict(row, cols))
 
 @app.post("/v1/alerts/<tx_id>/note")
 def update_alert_note(tx_id: str):
     try:
-        client_id = require_auth(request)
+        client_id = _require_auth(request)
     except ValueError as e:
         return jsonify({"error": str(e)}), 401
 
@@ -238,11 +233,11 @@ def update_alert_note(tx_id: str):
     if note is None or not isinstance(note, str) or len(note) > 2000:
         return jsonify({"error": "invalid_note"}), 400
 
+    cols = ["client_id", "transaction_id", "status", "note", "created_at", "updated_at"]
     with psycopg.connect(DATABASE_URL) as conn:
         cur = conn.execute(
             """
-            update alerts
-            set note = %s
+            update alerts set note = %s
             where client_id = %s and transaction_id = %s
             returning client_id, transaction_id, status, note, created_at, updated_at
             """,
@@ -253,9 +248,8 @@ def update_alert_note(tx_id: str):
 
     if not row:
         return jsonify({"error": "not_found"}), 404
+    return jsonify(_row(row, cols))
 
-    cols = ["client_id","transaction_id","status","note","created_at","updated_at"]
-    return jsonify(row_to_dict(row, cols))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)

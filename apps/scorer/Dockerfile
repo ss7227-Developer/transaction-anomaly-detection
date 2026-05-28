@@ -1,15 +1,9 @@
-FROM python:3.11-slim
-
+FROM python:3.12-slim
 WORKDIR /app
-
-COPY apps/scorer/requirements.txt .
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-COPY apps/scorer/worker.py .
-COPY apps/scorer/model_runtime.py .
-COPY apps/scorer/online_state.py .
-COPY ml ./ml
-
+COPY . /app/apps/scorer/
+COPY ../../ml /app/ml/
+WORKDIR /app/apps/scorer
 ENV PYTHONPATH=/app
-
-CMD ["python","-u", "worker.py"]
+CMD ["python", "worker.py"]

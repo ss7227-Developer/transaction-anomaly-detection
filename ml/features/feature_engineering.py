@@ -1,9 +1,9 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 
-# Keep ordering stable; model expects consistent feature order.
 FEATURE_NAMES = [
     "amount",
     "transaction_hour",
@@ -13,6 +13,7 @@ FEATURE_NAMES = [
     "latitude",
     "longitude",
 ]
+
 
 @dataclass(frozen=True)
 class Tx:
@@ -25,14 +26,16 @@ class Tx:
     home_lat: float
     home_lon: float
 
+
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
     r = 6371.0
     p = math.pi / 180.0
     dlat = (lat2 - lat1) * p
     dlon = (lon2 - lon1) * p
-    a = (math.sin(dlat / 2) ** 2 +
-         math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin(dlon / 2) ** 2)
+    a = (math.sin(dlat / 2) ** 2
+         + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin(dlon / 2) ** 2)
     return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
 
 def compute_features(tx: Tx, last_ts: datetime | None) -> tuple[list[float], datetime]:
     ts = datetime.fromisoformat(tx.timestamp)

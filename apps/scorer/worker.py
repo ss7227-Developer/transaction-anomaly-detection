@@ -13,7 +13,6 @@ from online_state import OnlineState
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ["REDIS_URL"]
-MODEL_NAME = os.environ.get("MODEL_NAME", "autoencoder")
 MODEL_VERSION = os.environ.get("MODEL_VERSION", "dev")
 MODEL_DIR = os.environ["MODEL_DIR"]
 
@@ -32,8 +31,6 @@ def main():
 
             _, payload = msg
             event = json.loads(payload)
-
-            # ✅ IMPORTANT: must be a string, not a tuple
             client_id = str(event.get("client_id") or "demo").strip()
 
             tx = Tx(
@@ -47,53 +44,38 @@ def main():
                 home_lon=float(event["home_lon"]),
             )
 
-            # ✅ tenant-scoped online state
             state_key = f"{client_id}:{tx.user_id}"
             last_ts = state.get_last_ts(state_key)
             features_row, current_ts = compute_features(tx, last_ts=last_ts)
             state.set_last_ts(state_key, current_ts)
 
-            recon_error = rt.reconstruction_error(features_row)
-            threshold = rt.threshold
-            is_anom = recon_error > threshold
+            # --- Autoencoder ---
+            ae_error = rt.reconstruction_error(features_row)
+            ae_threshold = rt.threshold
+            ae_is_anom = ae_error > ae_threshold
+
+            # --- Isolation Forest ---
+            if_score, if_is_anom = rt.if_predict(features_row)
+
+            # --- Ensemble: flag if either model flags ---
+            is_anomaly = ae_is_anom or if_is_anom
 
             with psycopg.connect(DATABASE_URL) as conn:
                 with conn.cursor() as cur:
-                    # Upsert prediction (tenant-safe)
-                    cur.execute(
-                        """
-                        insert into predictions(
-                            client_id,
-                            transaction_id, model_name, model_version,
-                            reconstruction_error, anomaly_threshold, is_predicted_anomaly
-                        )
-                        values (%s,%s,%s,%s,%s,%s,%s)
-                        on conflict (client_id, transaction_id, model_name, model_version)
-                        do update set
-                            reconstruction_error = excluded.reconstruction_error,
-                            anomaly_threshold = excluded.anomaly_threshold,
-                            is_predicted_anomaly = excluded.is_predicted_anomaly,
-                            created_at = now()
-                        """,
-                        (
-                            client_id,
-                            tx.transaction_id,
-                            MODEL_NAME,
-                            MODEL_VERSION,
-                            float(recon_error),
-                            float(threshold),
-                            bool(is_anom),
-                        ),
-                    )
+                    _upsert_prediction(cur, client_id, tx.transaction_id,
+                                       "autoencoder", MODEL_VERSION,
+                                       float(ae_error), float(ae_threshold), bool(ae_is_anom))
 
-                    # Create alert if anomaly (idempotent)
-                    if is_anom:
+                    _upsert_prediction(cur, client_id, tx.transaction_id,
+                                       "isolation_forest", MODEL_VERSION,
+                                       float(if_score), 0.0, bool(if_is_anom))
+
+                    if is_anomaly:
                         cur.execute(
                             """
                             insert into alerts(client_id, transaction_id, status)
                             values (%s, %s, 'OPEN')
-                            on conflict (client_id, transaction_id)
-                            do nothing
+                            on conflict (client_id, transaction_id) do nothing
                             """,
                             (client_id, tx.transaction_id),
                         )
@@ -101,13 +83,36 @@ def main():
                 conn.commit()
 
             print(
-                f"[scorer] tx={tx.transaction_id} client_id={client_id} "
-                f"recon_error={recon_error:.8f} threshold={threshold:.8f} anomaly={is_anom}"
+                f"[scorer] tx={tx.transaction_id} client={client_id} "
+                f"ae={ae_error:.6f}({'ANOM' if ae_is_anom else 'ok'}) "
+                f"if={if_score:.4f}({'ANOM' if if_is_anom else 'ok'}) "
+                f"=> {'ALERT' if is_anomaly else 'normal'}"
             )
 
         except Exception as e:
             print(f"[scorer] error: {e}")
             time.sleep(1)
+
+
+def _upsert_prediction(cur, client_id, tx_id, model_name, model_version,
+                        recon_error, threshold, is_anomaly):
+    cur.execute(
+        """
+        insert into predictions(
+            client_id, transaction_id, model_name, model_version,
+            reconstruction_error, anomaly_threshold, is_predicted_anomaly
+        )
+        values (%s, %s, %s, %s, %s, %s, %s)
+        on conflict (client_id, transaction_id, model_name, model_version)
+        do update set
+            reconstruction_error = excluded.reconstruction_error,
+            anomaly_threshold    = excluded.anomaly_threshold,
+            is_predicted_anomaly = excluded.is_predicted_anomaly,
+            created_at           = now()
+        """,
+        (client_id, tx_id, model_name, model_version,
+         recon_error, threshold, is_anomaly),
+    )
 
 
 if __name__ == "__main__":
