@@ -1,32 +1,32 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_USER: fraud
-      POSTGRES_PASSWORD: fraud
-      POSTGRES_DB: fraud
+      POSTGRES_DB: anomaly
+      POSTGRES_USER: anomaly
+      POSTGRES_PASSWORD: anomaly
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pg_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    volumes:
-      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
 
   redis:
-    image: redis:7
+    image: redis:7-alpine
     ports:
       - "6379:6379"
 
-
   api:
     build:
-      context: ..
-      dockerfile: apps/api/Dockerfile
-    image: infra-api
-    environment:
-      DATABASE_URL: postgresql://fraud:fraud@postgres:5432/fraud
-      REDIS_URL: redis://redis:6379/0
-      CLIENT_API_KEYS: demo=demo_key_123
+      context: ../apps/api
     ports:
       - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://anomaly:anomaly@postgres:5432/anomaly
+      REDIS_URL: redis://redis:6379
+      CLIENT_API_KEYS: client_a=secret1,client_b=secret2
     depends_on:
       - postgres
       - redis
@@ -36,13 +36,15 @@ services:
       context: ..
       dockerfile: apps/scorer/Dockerfile
     environment:
-      DATABASE_URL: postgresql://fraud:fraud@postgres:5432/fraud
-      REDIS_URL: redis://redis:6379/0
-      MODEL_NAME: "autoencoder"
-      MODEL_VERSION: "dev"
-      MODEL_DIR: /models
+      DATABASE_URL: postgresql://anomaly:anomaly@postgres:5432/anomaly
+      REDIS_URL: redis://redis:6379
+      MODEL_DIR: /app/ml/artifacts/dev
+      MODEL_VERSION: dev
     volumes:
-      - ../ml/artifacts/dev:/models:ro
+      - ../ml/artifacts:/app/ml/artifacts:ro
     depends_on:
       - postgres
       - redis
+
+volumes:
+  pg_data:

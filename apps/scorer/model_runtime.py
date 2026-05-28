@@ -29,37 +29,44 @@ class Autoencoder(nn.Module):
 
 class ModelRuntime:
     """
-    Loads a versioned model bundle:
-      - autoencoder_model.pt
-      - minmax_scaler.joblib
-      - threshold.txt
-
-    Produces reconstruction error on *scaled* features.
+    Loads a versioned model bundle from model_dir:
+      autoencoder_model.pt   — PyTorch weights
+      minmax_scaler.joblib   — sklearn MinMaxScaler
+      threshold.txt          — AE anomaly threshold
+      isolation_forest.joblib — sklearn IsolationForest
     """
+
     def __init__(self, model_dir: str):
         self.model_dir = model_dir
 
-        threshold_path = os.path.join(model_dir, "threshold.txt")
-        self.threshold = float(open(threshold_path).read().strip())
+        # --- Autoencoder ---
+        self.ae_threshold = float(
+            open(os.path.join(model_dir, "threshold.txt")).read().strip()
+        )
+        self.scaler = joblib.load(os.path.join(model_dir, "minmax_scaler.joblib"))
+        self._ae = Autoencoder(input_dim=7, hidden_dim=[64, 32, 16], latent_dim=8)
+        self._ae.load_state_dict(
+            torch.load(os.path.join(model_dir, "autoencoder_model.pt"), map_location="cpu")
+        )
+        self._ae.eval()
 
-        scaler_path = os.path.join(model_dir, "minmax_scaler.joblib")
-        self.scaler = joblib.load(scaler_path)
+        # --- Isolation Forest ---
+        self._if = joblib.load(os.path.join(model_dir, "isolation_forest.joblib"))
 
-        weights_path = os.path.join(model_dir, "autoencoder_model.pt")
-        self.model = Autoencoder(input_dim=7, hidden_dim=[64, 32, 16], latent_dim=8)
-        self.model.load_state_dict(torch.load(weights_path, map_location="cpu"))
-        self.model.eval()
+    @property
+    def threshold(self) -> float:
+        return self.ae_threshold
 
     def reconstruction_error(self, features_row: list[float]) -> float:
-        """
-        features_row: raw (unscaled) features in correct order.
-        returns: mean squared reconstruction error in scaled space
-        """
-        x_scaled = self.scaler.transform([features_row])  # shape (1,7)
-        x = torch.tensor(x_scaled, dtype=torch.float32)
-
+        x_s = self.scaler.transform([features_row])
+        x = torch.tensor(x_s, dtype=torch.float32)
         with torch.no_grad():
-            recon = self.model(x)
+            recon = self._ae(x)
             err = torch.mean((x - recon) ** 2, dim=1).item()
-
         return float(err)
+
+    def if_predict(self, features_row: list[float]) -> tuple[float, bool]:
+        """Returns (anomaly_score, is_anomaly). Score < 0 means more anomalous."""
+        score = float(self._if.score_samples([features_row])[0])
+        is_anomaly = self._if.predict([features_row])[0] == -1
+        return score, is_anomaly
