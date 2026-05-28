@@ -40,7 +40,7 @@ The autoencoder learns a compressed latent representation of normal spending pat
 | `transaction_hour` | Extracted from timestamp |
 | `transaction_day_of_week` | Extracted from timestamp |
 | `distance_from_home` | Haversine distance (km) between tx location and user home |
-| `time_since_last_transaction` | Per-user velocity; tracked in Redis across warm Lambda invocations |
+| `time_since_last_transaction` | Per-user velocity; tracked in Redis per tenant across requests |
 | `latitude`, `longitude` | Raw GPS fields |
 
 ### Fraud types modeled in training data
@@ -50,16 +50,28 @@ The autoencoder learns a compressed latent representation of normal spending pat
 - **Velocity attack**: 1–4 rapid small transactions in burst
 - **Stolen card**: high amount + foreign location
 
-### Evaluation (sample output)
+### Evaluation results
 
-```
-Model                        F1       Prec    Recall    Net Savings
-Autoencoder                0.XXXX   0.XXXX   0.XXXX   $XXX,XXX
-Isolation Forest           0.XXXX   0.XXXX   0.XXXX   $XXX,XXX
-Ensemble  (AE OR IF flags) 0.XXXX   0.XXXX   0.XXXX   $XXX,XXX
-```
+Trained and evaluated on 10,000 simulated transactions (90 fraud, 0.9% rate) across 100 users.
+Test set: 1,982 normal + 90 fraud held-out samples.
 
-Business impact is computed using simulated costs: $100/false positive (manual review), $1,000/true positive (fraud prevented), $500 average undetected fraud loss.
+| Model | F1 | Precision | Recall | TN | FP | FN | TP |
+|---|---|---|---|---|---|---|---|
+| Autoencoder | **0.75** | 0.86 | 0.67 | 1972 | 10 | 30 | 60 |
+| Isolation Forest | 0.54 | **0.92** | 0.38 | 1979 | 3 | 56 | 34 |
+| Ensemble (AE OR IF) | 0.74 | 0.83 | 0.67 | 1970 | 12 | 30 | 60 |
+
+**Simulated business impact** ($1,000 saved per fraud caught, $100 cost per false alarm):
+
+| Model | Net Savings |
+|---|---|
+| Autoencoder | **$59,000** |
+| Isolation Forest | $33,700 |
+| Ensemble (AE OR IF) | $58,800 |
+
+The Autoencoder is the strongest single model. The Isolation Forest is highly precise (92%) but misses 62% of fraud — useful as a high-confidence signal. The ensemble marginally increases false positives without improving recall, suggesting AE alone is the better production choice at this threshold.
+
+Business impact uses simulated costs: $100/false positive (manual review), $1,000/true positive (fraud prevented), $500 average undetected fraud loss.
 
 ## Stack
 
