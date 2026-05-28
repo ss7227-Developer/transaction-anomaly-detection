@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: fraud
+      POSTGRES_PASSWORD: fraud
+      POSTGRES_DB: fraud
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    image: infra-api
+    environment:
+      DATABASE_URL: postgresql://fraud:fraud@postgres:5432/fraud
+      REDIS_URL: redis://redis:6379/0
+      CLIENT_API_KEYS: demo=demo_key_123
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  scorer:
+    build:
+      context: ..
+      dockerfile: apps/scorer/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://fraud:fraud@postgres:5432/fraud
+      REDIS_URL: redis://redis:6379/0
+      MODEL_NAME: "autoencoder"
+      MODEL_VERSION: "dev"
+      MODEL_DIR: /models
+    volumes:
+      - ../ml/artifacts/dev:/models:ro
+    depends_on:
+      - postgres
+      - redis
